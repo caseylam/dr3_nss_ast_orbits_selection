@@ -3,20 +3,25 @@ import utils
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 
-def p_nss(ra, dec, porb, e, parallax, mass1, mass2, gmag1, gmag2, n_sample = 100, mag='app'):
+def p_nss(ra, dec, porb, e, parallax, mass1, mass2, gmag1, gmag2, n_sample = 100, mag='app', return_index=False):
     """
-    ra, dec [decimal deg]
+    Calculate the probability that a source is included in the Gaia DR3
+    NSS astrometric orbit catalog. The probabilistic parts of this
+    calculation are in calculating ruwe, parallax error, a0_error.
+    Everything else is deterministic.
+    
+    ra, dec [deg]
     porb : orbital period [days]
     e : eccentricity
     parallax : mas
     m1, m2: primary, secondary mass [Msun]
-    g1, g2: primary, secondary apparent magnitudes [Gaia mag]. If you want a dark companion, give it magnitude of 9999.
+    g1, g2: primary, secondary apparent magnitudes [Gaia mag].
+    If you want a dark companion, give it magnitude of 9999.
     n_sample : number of random samples
     mag = 'app' or 'abs'. If you do 'app', then it won't call the dust map, etc.
-    return_index : bool
-        If True, return the indices of the good solutions
-
-    If you do 'abs', it WILL call the dust map and use the parallax to place it at the right distance.
+    If you do 'abs', it WILL call the dust map and use the parallax to place it
+    at the right distance.
+    return_index (bool): 
     """
     # Make sure n_sample is an integer. This is so we can get the probabilistic parts of the calculation.
     # Make all the inputs arrays the length of n_sample.
@@ -30,15 +35,12 @@ def p_nss(ra, dec, porb, e, parallax, mass1, mass2, gmag1, gmag2, n_sample = 100
         mass2 = mass2 * np.ones(n_sample)
         gmag1 = gmag1 * np.ones(n_sample)
         gmag2 = gmag2 * np.ones(n_sample)
-        
-    # For inclination, we just assume isotropic in cosi.
-    # is it random 0 to 1, or -1 to 1? Also arccos only is 0 to pi?
-    # Since it's |cosi| that comes into the calculations, maybe this doesn't matter.
-    # CHECK THOUGH!
-    # i is in RADIANS.
+
+    # For inclination, we assume isotropic in cosi.
     cosi = np.random.random(n_sample)
     i = np.arccos(cosi)
-
+    omega = np.random.uniform(0, 2*np.pi, n_sample)
+    
     # Binary magnitude
     if mag == 'app':
         gmag1_app = gmag1
@@ -52,8 +54,6 @@ def p_nss(ra, dec, porb, e, parallax, mass1, mass2, gmag1, gmag2, n_sample = 100
         coords = SkyCoord(ra=ra*u.deg,
                           dec=dec*u.deg,
                           distance=(1/parallax)*u.kpc)
-        # Add some noise here so you get a little variation.
-        # Arbitrary... say within 1 deg^2 (how fine is dust map?) and 10% of distance?
         glat = coords.galactic.b.value
         glon = coords.galactic.l.value
         rad = 1/parallax
@@ -70,23 +70,47 @@ def p_nss(ra, dec, porb, e, parallax, mass1, mass2, gmag1, gmag2, n_sample = 100
     a0 = dql * a_AU * parallax
 
     # Calculate ruwe. Broadcast to the size of n_sample.
-    ruwe = utils.pred_ruwe_obs(a0, gmag, i, e, ra, dec)
+    ruwe = utils.pred_ruwe_obs_using_sims(a0, gmag, i, e, omega, porb, ra, dec)
 
     nviz = utils.healpix_nviz_periods(ra, dec)
-    
-    # Calculate parallax_error
-    parallax_error = utils.get_parallax_error_values_nss(gmag, nviz)
-    
-    # Calculate photocenter error
-    a0_error = utils.get_a0_error_values_nss(gmag, nviz)
 
-    # Apply cuts.
-    idx = np.where((ruwe > 1.4) &
-                   (a0/a0_error > np.max([np.ones(n_sample) * 5, 158/np.sqrt(porb)], axis=0)) & 
-                   (parallax/parallax_error > 20000/porb) &
-                   (utils.empirical_period_probability(porb)[0]))[0]
+    # Figure out what passes the ruwe cut.
+    ruwe_idx = np.where(ruwe > 1.4)[0]
 
-    print('Number detected : ', len(idx))
+    # Figure out what passes the acceleration cuts.
+    acc9_idx = utils.remove_acc9(porb[ruwe_idx], a0[ruwe_idx], gmag[ruwe_idx])
+    acc7_idx = utils.remove_acc7(porb[ruwe_idx][acc9_idx],
+                                 a0[ruwe_idx][acc9_idx],
+                                 gmag[ruwe_idx][acc9_idx])
+
+    # Figure out what passes the orbital solution cut.
+    parallax_error = utils.predict_single_star_parallax_error(gmag[ruwe_idx][acc9_idx][acc7_idx],
+                                                              nviz[ruwe_idx][acc9_idx][acc7_idx])
+    
+    # Despite the name of the function, this applies to the a0 error also.
+    a0_error = utils.predict_single_star_parallax_error(gmag[ruwe_idx][acc9_idx][acc7_idx],
+                                                              nviz[ruwe_idx][acc9_idx][acc7_idx])
+    
+    parallax_error_correction = utils.calc_orb_error_rescale_candidate('parallax',
+                                                                       porb[ruwe_idx][acc9_idx][acc7_idx],
+                                                                       e[ruwe_idx][acc9_idx][acc7_idx],
+                                                                       gmag[ruwe_idx][acc9_idx][acc7_idx])
+    
+    a0_error_correction = utils.calc_orb_error_rescale_candidate('a0',
+                                                                 porb[ruwe_idx][acc9_idx][acc7_idx],
+                                                                 e[ruwe_idx][acc9_idx][acc7_idx],
+                                                                 gmag[ruwe_idx][acc9_idx][acc7_idx])
+    
+    parallax_sig = parallax[ruwe_idx][acc9_idx][acc7_idx]/(parallax_error * parallax_error_correction)
+    a0_sig = a0[ruwe_idx][acc9_idx][acc7_idx]/(a0_error * a0_error_correction)
+    
+    idx = np.where((parallax_sig > 20000/porb[ruwe_idx][acc9_idx][acc7_idx]) &
+                   (a0_sig > np.maximum(np.ones(len(a0_sig)) * 5, 158/np.sqrt(porb[ruwe_idx][acc9_idx][acc7_idx]))))[0]
+
     print('Probability of detecting [0 - 1]: {0:.4f}'.format(len(idx)/n_sample))
 
-    return len(idx)/n_sample
+    if return_index:
+        print(len(idx))
+        return ruwe_idx, acc9_idx, acc7_idx, idx
+    else:
+        return len(idx)/n_sample
